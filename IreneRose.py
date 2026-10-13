@@ -13,7 +13,6 @@ import os
 import sys
 import json
 import time
-import math
 import re
 import getpass
 import subprocess
@@ -22,6 +21,12 @@ import platform
 import hashlib
 from pathlib import Path
 from datetime import datetime
+
+try:
+    from analysis import dga_score, extract_ips, extract_hashes
+except ImportError:  # imported from another directory: look next to this file
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from analysis import dga_score, extract_ips, extract_hashes
 
 # ── pink palette ─────────────────────────────────────────────────────────────
 class P:
@@ -68,7 +73,7 @@ CATEGORIES = [
         ("YaraRose", "YARA malware scanner"),
         ("PatchRose", "Patch checker"),
         ("KernelRose", "Kernel rootkit detector"),
-        ("C2Rose", "C2 framework launcher"),
+        ("C2Rose", "C2 lab reference (authorized labs only)"),
     ]),
     ("AUTH & ACCESS", [
         ("AuthRose", "Auth log analyzer"),
@@ -251,40 +256,6 @@ def module_sniffrose():
     else:
         print(f"  {C.YELLOW}tshark/tcpdump not installed.{C.RESET}")
 
-def _shannon_entropy(s: str) -> float:
-    # Adapted pattern from CABTA entropy_analyzer.py — stdlib only
-    if not s:
-        return 0.0
-    from collections import Counter
-    counts = Counter(s)
-    n = len(s)
-    return -sum((c / n) * math.log2(c / n) for c in counts.values())
-
-def _dga_score(domain: str) -> dict:
-    # Simplified 4-heuristic version of CABTA dga_detector.py:
-    # entropy + length + digit-ratio + consonant-ratio
-    sld = domain.lower().strip().rstrip(".").split(".")[0]
-    ent = _shannon_entropy(sld)
-    length = len(sld)
-    digits = sum(ch.isdigit() for ch in sld) / max(1, length)
-    vowels = set("aeiou")
-    cons = sum(ch.isalpha() and ch not in vowels for ch in sld) / max(1, length)
-    score = 0
-    if ent > 3.8:
-        score += 30
-    elif ent > 3.2:
-        score += 15
-    if length > 18:
-        score += 25
-    elif length > 12:
-        score += 10
-    if digits > 0.3:
-        score += 20
-    if cons > 0.7 and length > 8:
-        score += 15
-    verdict = "LIKELY-DGA" if score >= 50 else "SUSPICIOUS" if score >= 30 else "LIKELY-LEGIT"
-    return {"domain": domain, "sld": sld, "entropy": round(ent, 2), "len": length, "score": score, "verdict": verdict}
-
 def module_dnsrose():
     banner("DNSRose — DNS Exfil Detector")
     print(f"  {C.PINK}DGA / exfil heuristic scorer (entropy+length+digit+consonant).{C.RESET}")
@@ -292,7 +263,7 @@ def module_dnsrose():
     target = input(f"  {C.CYAN}Domain to score (blank for demo list):{C.RESET} ").strip()
     domains = [target] if target else ["google.com", "github.com", "x7f9k2qz8pl4m1x.com", "akd83ks82d9s7f23skd.com"]
     for d in domains:
-        r = _dga_score(d)
+        r = dga_score(d)
         col = C.RED if r["verdict"] == "LIKELY-DGA" else C.YELLOW if r["verdict"] == "SUSPICIOUS" else C.GREEN
         print(f"  {col}{r['verdict']:>13}{C.RESET} {r['domain']:<32} ent={r['entropy']} len={r['len']} score={r['score']}")
     print(f"\n  {C.YELLOW}Live tip: sudo tcpdump -i any port 53 -l | grep --line-buffered -E '.{{40,}}'{C.RESET}")
@@ -410,7 +381,10 @@ def module_kernelrose():
         print(f"\n{C.GRAY}{out[:2000]}{C.RESET}")
 
 def module_c2rose():
-    banner("C2Rose — C2 Framework Launcher")
+    banner("C2Rose — C2 Lab Reference")
+    print(f"  {C.YELLOW}Scope: understand/detect C2 beacons against systems you own")
+    print(f"  or are authorized to test — in an isolated lab. Not for use against")
+    print(f"  anyone else's infrastructure.{C.RESET}")
     print(f"  1. Check Sliver")
     print(f"  2. Check Havoc")
     print(f"  3. Install Sliver")
@@ -449,13 +423,12 @@ def module_authrose():
     if not out:
         print(f"  {C.YELLOW}Empty log or need sudo.{C.RESET}")
         return
-    ip_re = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
     fails: dict[str, int] = {}
     accepts = 0
     for ln in out.splitlines():
         ll = ln.lower()
         if "failed" in ll or "invalid" in ll:
-            for ip in ip_re.findall(ln):
+            for ip in extract_ips(ln):
                 fails[ip] = fails.get(ip, 0) + 1
         if "accepted" in ll:
             accepts += 1
@@ -518,8 +491,6 @@ def module_logrose():
     except Exception as e:
         print(f"  {C.YELLOW}Read failed: {e}{C.RESET}")
         return
-    ip_re = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
-    hash_re = re.compile(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b")
     ips: dict[str, int] = {}
     hashes: set[str] = set()
     fails = 0
@@ -527,10 +498,9 @@ def module_logrose():
         ll = ln.lower()
         if "failed" in ll or "invalid" in ll or "denied" in ll or "error" in ll:
             fails += 1
-        for ip in ip_re.findall(ln):
-            if not (ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("127.")):
-                ips[ip] = ips.get(ip, 0) + 1
-        for h in hash_re.findall(ln):
+        for ip in extract_ips(ln, skip_private=True):
+            ips[ip] = ips.get(ip, 0) + 1
+        for h in extract_hashes(ln):
             hashes.add(h)
     print(f"  Scanned {len(lines)} lines — fails/errors: {fails}, unique public IPs: {len(ips)}, hashes: {len(hashes)}")
     top = sorted(ips.items(), key=lambda x: x[1], reverse=True)[:10]

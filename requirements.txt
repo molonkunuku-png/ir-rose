@@ -1,5 +1,5 @@
 # IreneRose is stdlib-only by design.
-# No hard Python deps required.
+# No hard Python deps required. Test runner (dev only): pytest
 #
 # Optional (install as needed):
 # yara-python      # YaraRose richer integration
