@@ -1,0 +1,9 @@
+# IreneRose is stdlib-only by design.
+# No hard Python deps required.
+#
+# Optional (install as needed):
+# yara-python      # YaraRose richer integration
+# sigma-cli        # SigmaRose full convert
+# chainsaw         # via cargo install chainsaw (EVTX)
+#
+# System tools (via SetupRose): nmap, tshark, tcpdump, whois, dig, lynis, yara, nuclei, sliver

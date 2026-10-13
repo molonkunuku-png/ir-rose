@@ -13,6 +13,9 @@ import os
 import sys
 import json
 import time
+import math
+import re
+import getpass
 import subprocess
 import shutil
 import platform
@@ -88,6 +91,8 @@ CATEGORIES = [
         ("ComplianceRose", "CIS checks"),
         ("AssetRose", "Asset inventory"),
         ("ConfigRose", "Config auditor"),
+        ("BackupRose", "Backup verifier"),
+        ("ChecklistRose", "Hygiene checklist"),
         ("LynisRose", "Lynis wrapper"),
     ]),
     ("UTILITIES", [
@@ -246,11 +251,51 @@ def module_sniffrose():
     else:
         print(f"  {C.YELLOW}tshark/tcpdump not installed.{C.RESET}")
 
+def _shannon_entropy(s: str) -> float:
+    # Adapted pattern from CABTA entropy_analyzer.py — stdlib only
+    if not s:
+        return 0.0
+    from collections import Counter
+    counts = Counter(s)
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+def _dga_score(domain: str) -> dict:
+    # Simplified 4-heuristic version of CABTA dga_detector.py:
+    # entropy + length + digit-ratio + consonant-ratio
+    sld = domain.lower().strip().rstrip(".").split(".")[0]
+    ent = _shannon_entropy(sld)
+    length = len(sld)
+    digits = sum(ch.isdigit() for ch in sld) / max(1, length)
+    vowels = set("aeiou")
+    cons = sum(ch.isalpha() and ch not in vowels for ch in sld) / max(1, length)
+    score = 0
+    if ent > 3.8:
+        score += 30
+    elif ent > 3.2:
+        score += 15
+    if length > 18:
+        score += 25
+    elif length > 12:
+        score += 10
+    if digits > 0.3:
+        score += 20
+    if cons > 0.7 and length > 8:
+        score += 15
+    verdict = "LIKELY-DGA" if score >= 50 else "SUSPICIOUS" if score >= 30 else "LIKELY-LEGIT"
+    return {"domain": domain, "sld": sld, "entropy": round(ent, 2), "len": length, "score": score, "verdict": verdict}
+
 def module_dnsrose():
     banner("DNSRose — DNS Exfil Detector")
-    print(f"  {C.PINK}Monitoring DNS queries for exfil patterns...{C.RESET}")
-    print(f"  {C.YELLOW}Run: sudo tcpdump -i any port 53 | python3 -u {sys.argv[0]} dns-monitor{C.RESET}")
-    print(f"  {C.GRAY}Tip: long subdomains, high entropy, base64-like strings = suspicious{C.RESET}")
+    print(f"  {C.PINK}DGA / exfil heuristic scorer (entropy+length+digit+consonant).{C.RESET}")
+    print(f"  {C.GRAY}Ref: CABTA dga_detector.py (7 heuristics) simplified to stdlib-only 4.{C.RESET}")
+    target = input(f"  {C.CYAN}Domain to score (blank for demo list):{C.RESET} ").strip()
+    domains = [target] if target else ["google.com", "github.com", "x7f9k2qz8pl4m1x.com", "akd83ks82d9s7f23skd.com"]
+    for d in domains:
+        r = _dga_score(d)
+        col = C.RED if r["verdict"] == "LIKELY-DGA" else C.YELLOW if r["verdict"] == "SUSPICIOUS" else C.GREEN
+        print(f"  {col}{r['verdict']:>13}{C.RESET} {r['domain']:<32} ent={r['entropy']} len={r['len']} score={r['score']}")
+    print(f"\n  {C.YELLOW}Live tip: sudo tcpdump -i any port 53 -l | grep --line-buffered -E '.{{40,}}'{C.RESET}")
 
 def module_shieldrose():
     banner("ShieldRose — Lightweight NIDS", angry=True)
@@ -273,8 +318,12 @@ def module_shieldrose():
                     alerts.append(("LOW", src, "SYN-ACK"))
                 elif flags == "0x14":
                     alerts.append(("HIGH", src, "RST scan"))
-                elif int(length) > 9000:
-                    alerts.append(("MEDIUM", src, "Large packet"))
+                else:
+                    try:
+                        if int((length or "0").strip() or 0) > 9000:
+                            alerts.append(("MEDIUM", src, "Large packet"))
+                    except ValueError:
+                        pass
     if not alerts and tcpdump:
         out, err, rc = run(["tcpdump", "-i", iface, "-c", "50", "-n", "-q"], timeout=30)
         if rc == 0 and out:
@@ -318,15 +367,19 @@ def module_yararose():
         print(f"  {C.YELLOW}yara not found. Install: pip install yara-python{C.RESET}")
         return
     rule_dirs = [Path.home() / ".config" / "iru" / "rules", Path("/usr/share/yara/rules")]
-    rules = []
+    rule_files = []
     for d in rule_dirs:
-        if d.exists():
-            rules.extend(str(d))
-    if not rules:
+        if d.is_file() and d.suffix in (".yar", ".yara", ".rule"):
+            rule_files.append(str(d))
+        elif d.is_dir():
+            rule_files.extend([str(p) for p in d.glob("*.yar")])
+            rule_files.extend([str(p) for p in d.glob("*.yara")])
+    if not rule_files:
         print(f"  {C.YELLOW}No YARA rules found.{C.RESET}")
+        print(f"  {C.GRAY}Checked: {', '.join(str(d) for d in rule_dirs)}{C.RESET}")
         return
-    print(f"  {C.PINK}Scanning {target}...{C.RESET}")
-    out, err, rc = run(["yara", "-r", rules[0], target], timeout=60)
+    print(f"  {C.PINK}Scanning {target} with {rule_files[0]}...{C.RESET}")
+    out, err, rc = run(["yara", "-r", rule_files[0], target], timeout=60)
     if rc == 0 and out:
         print(f"\n{out[:5000]}")
     else:
@@ -392,16 +445,36 @@ def module_authrose():
     if not Path(log).exists():
         print(f"  {C.YELLOW}No auth log found at /var/log/auth.log or /var/log/secure{C.RESET}")
         return
-    out, _, _ = run(["sudo", "tail", "-n", "50", log], timeout=10)
-    print(f"\n{C.GRAY}{out[:4000]}{C.RESET}")
+    out, _, _ = run(["sudo", "tail", "-n", "200", log], timeout=10)
+    if not out:
+        print(f"  {C.YELLOW}Empty log or need sudo.{C.RESET}")
+        return
+    ip_re = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
+    fails: dict[str, int] = {}
+    accepts = 0
+    for ln in out.splitlines():
+        ll = ln.lower()
+        if "failed" in ll or "invalid" in ll:
+            for ip in ip_re.findall(ln):
+                fails[ip] = fails.get(ip, 0) + 1
+        if "accepted" in ll:
+            accepts += 1
+    print(f"  Accepted: {accepts}, failing IPs: {len(fails)}")
+    for ip, c in sorted(fails.items(), key=lambda x: x[1], reverse=True)[:10]:
+        flag = "BRUTE?" if c >= 5 else ""
+        print(f"    {C.RED if c >= 5 else C.YELLOW}{c:>4}x{C.RESET} {ip} {flag}")
 
 def module_vaultrose():
     banner("VaultRose — Secret Locker")
     name = input(f"  {C.CYAN}Secret name:{C.RESET} ").strip()
-    val = input(f"  {C.CYAN}Secret value:{C.RESET} ").strip()
+    try:
+        val = getpass.getpass(f"  Secret value (hidden): ")
+    except Exception:
+        val = input(f"  {C.CYAN}Secret value:{C.RESET} ").strip()
     if name and val:
         enc = hashlib.sha256(val.encode()).hexdigest()[:16]
-        print(f"  {C.GREEN}Stored {name} (hash: {enc}){C.RESET}")
+        print(f"  {C.GREEN}Hashed {name} (sha256[:16]: {enc}){C.RESET}")
+        print(f"  {C.GRAY}Note: plaintext not stored — keep value in your vault.{C.RESET}")
 
 def module_accessrose():
     banner("AccessRose — Permission Auditor")
@@ -435,32 +508,102 @@ def module_sshrose():
 
 def module_logrose():
     banner("LogRose — Log Analyzer")
+    print(f"  {C.GRAY}Ref: CABTA ioc_extractor.py + btl1-field-notes 04_SIEM_Analysis common searches.{C.RESET}")
     path = input(f"  {C.CYAN}Log file path:{C.RESET} ").strip()
     if not path or not Path(path).exists():
         print(f"  {C.YELLOW}Log not found.{C.RESET}")
         return
-    out, _, _ = run(["tail", "-n", "100", path], timeout=10)
-    print(f"\n{C.GRAY}{out[:5000]}{C.RESET}")
+    try:
+        lines = Path(path).read_text(errors="ignore").splitlines()[-500:]
+    except Exception as e:
+        print(f"  {C.YELLOW}Read failed: {e}{C.RESET}")
+        return
+    ip_re = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b")
+    hash_re = re.compile(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b")
+    ips: dict[str, int] = {}
+    hashes: set[str] = set()
+    fails = 0
+    for ln in lines:
+        ll = ln.lower()
+        if "failed" in ll or "invalid" in ll or "denied" in ll or "error" in ll:
+            fails += 1
+        for ip in ip_re.findall(ln):
+            if not (ip.startswith("10.") or ip.startswith("192.168.") or ip.startswith("127.")):
+                ips[ip] = ips.get(ip, 0) + 1
+        for h in hash_re.findall(ln):
+            hashes.add(h)
+    print(f"  Scanned {len(lines)} lines — fails/errors: {fails}, unique public IPs: {len(ips)}, hashes: {len(hashes)}")
+    top = sorted(ips.items(), key=lambda x: x[1], reverse=True)[:10]
+    for ip, c in top:
+        print(f"    {C.YELLOW}{c:>4}x{C.RESET} {ip}")
+    if hashes:
+        print(f"  {C.CYAN}Hashes:{C.RESET} {', '.join(list(hashes)[:5])}")
+    print(f"  {C.GRAY}SPL hint: index=* | stats count by src_ip | sort -count{C.RESET}")
 
 def module_alertrose():
     banner("AlertRose — Alert Dashboard")
-    print(f"  {C.PINK}Recent alerts (simulated):{C.RESET}")
-    print(f"  {C.GREEN}[OK]{C.RESET}   No critical alerts right now.")
-    print(f"  {C.YELLOW}[INFO]{C.RESET} System scan completed.")
+    exp = Path("export")
+    files = sorted(exp.glob("*.json"))[-5:] if exp.exists() else []
+    if not files:
+        print(f"  {C.PINK}Recent alerts:{C.RESET}")
+        print(f"  {C.GREEN}[OK]{C.RESET}   No critical alerts right now.")
+        print(f"  {C.YELLOW}[INFO]{C.RESET} System scan completed. Run LogRose/AuthRose then ExportRose to populate.")
+        return
+    print(f"  {C.PINK}Last {len(files)} export(s):{C.RESET}")
+    for f in files:
+        try:
+            data = json.loads(f.read_text())
+            print(f"    {f.name}: {len(data) if isinstance(data, list) else 'obj'} entries")
+        except Exception:
+            print(f"    {f.name}: (unreadable)")
 
 def module_sigmarose():
     banner("SigmaRose — Sigma Rule Converter")
-    print(f"  {C.PINK}Sigma conversion utility.{C.RESET}")
-    print(f"  {C.YELLOW}Install sigma-cli: pip install sigma-cli{C.RESET}")
-    print(f"  {C.GRAY}Usage: sigma convert -t splunk rule.yml{C.RESET}")
+    print(f"  {C.GRAY}Ref: CABTA rule_generator.py — KQL/SPL/Sigma/YARA from single IOC.{C.RESET}")
+    ioc = input(f"  {C.CYAN}IOC (ip/domain/hash/url):{C.RESET} ").strip()
+    if not ioc:
+        print(f"  {C.YELLOW}Install sigma-cli for full convert: pip install sigma-cli{C.RESET}")
+        print(f"  {C.GRAY}Usage: sigma convert -t splunk rule.yml{C.RESET}")
+        return
+    if re.match(r"^(?:\d+\.){3}\d+$", ioc):
+        itype = "ipv4"
+    elif re.match(r"^[a-fA-F0-9]{32}$|^[a-fA-F0-9]{40}$|^[a-fA-F0-9]{64}$", ioc):
+        itype = "hash"
+    elif ioc.startswith("http"):
+        itype = "url"
+    else:
+        itype = "domain"
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    outdir = Path("export") / f"sigma_{ts}"
+    outdir.mkdir(parents=True, exist_ok=True)
+    kql = f"// KQL - Hunt {itype}: {ioc}\nDeviceNetworkEvents\n| where Timestamp > ago(30d)\n| where RemoteIP == \"{ioc}\" or RemoteUrl has \"{ioc}\"\n"
+    spl = f"# SPL - Hunt {itype}: {ioc}\nindex=* earliest=-30d\n| search dest_ip=\"{ioc}\" OR url=\"*{ioc}*\" OR hash=\"{ioc}\"\n| stats count by host\n"
+    sigma = f"title: Hunt {ioc}\nstatus: test\nlogsource:\n  category: network_connection\n  product: windows\nselection:\n  DestinationIp: '{ioc}'\n  Query: '*{ioc}*'\ncondition: selection\nlevel: medium\n"
+    (outdir / "hunt.kql").write_text(kql)
+    (outdir / "hunt.spl").write_text(spl)
+    (outdir / "hunt.yml").write_text(sigma)
+    print(f"  {C.GREEN}Wrote {outdir}/hunt.{{kql,spl,yml}}{C.RESET}")
+    print(f"\n{C.GRAY}{sigma[:600]}{C.RESET}")
 
 def module_vtlookuprose():
     banner("VTLookupRose — VirusTotal Lookup")
     h = input(f"  {C.CYAN}File hash (MD5/SHA1/SHA256):{C.RESET} ").strip()
     if not h:
         return
-    print(f"  {C.PINK}Lookup {h} on VirusTotal...{C.RESET}")
+    import urllib.request
+    api = os.environ.get("VT_API_KEY", "")
     print(f"  {C.GRAY}https://www.virustotal.com/gui/file/{h}{C.RESET}")
+    if not api:
+        print(f"  {C.YELLOW}Set VT_API_KEY for live lookup — showing link only.{C.RESET}")
+        return
+    try:
+        req = urllib.request.Request(f"https://www.virustotal.com/api/v3/files/{h}", headers={"x-apikey": api})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode())
+            stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            print(f"  {C.PINK}VT stats:{C.RESET} {stats}")
+    except Exception as e:
+        print(f"  {C.YELLOW}VT lookup failed: {e}{C.RESET}")
 
 def module_chainsawrose():
     banner("ChainsawRose — EVTX Forensics")
@@ -480,36 +623,52 @@ def module_chainsawrose():
 
 def module_forensicrose():
     banner("ForensicRose — Disk Forensics Helper")
-    img = input(f"  {C.CYAN}Disk image path:{C.RESET} ").strip()
-    if not img:
+    print(f"  {C.GRAY}Ref: DFIR-Toolkit (mmls, timeline, logs) + btl1 03_Digital_Forensics (Volatility).{C.RESET}")
+    img = input(f"  {C.CYAN}Disk image path (blank for live-host triage):{C.RESET} ").strip()
+    if img:
+        if not which("mmls"):
+            print(f"  {C.YELLOW}sleuthkit not installed. Install: sudo pacman -S sleuthkit / sudo apt install sleuthkit{C.RESET}")
+        else:
+            out, _, _ = run(["mmls", img], timeout=15)
+            print(f"\n{C.GRAY}{out[:3000]}{C.RESET}")
+        print(f"  {C.GRAY}Volatility hints: vol -f mem.raw windows.pslist windows.malfind windows.netscan{C.RESET}")
         return
-    if not which("mmls"):
-        print(f"  {C.YELLOW}sleuthkit not installed. Install: sudo pacman -S sleuthkit{C.RESET}")
-        return
-    out, _, _ = run(["mmls", img], timeout=15)
-    print(f"\n{C.GRAY}{out[:3000]}{C.RESET}")
+    print(f"  {C.PINK}Live triage: timeline + bash_history + /var/log list{C.RESET}")
+    for p in [Path.home() / ".bash_history", Path("/var/log/auth.log"), Path("/var/log/syslog")]:
+        print(f"  {'present' if p.exists() else 'missing':>7} {p}")
 
 def module_irplaybookrose():
     banner("IRPlaybookRose — Incident Response Playbook")
-    print(f"  1. Containment checklist")
-    print(f"  2. Eradication checklist")
-    print(f"  3. Recovery checklist")
+    print(f"  {C.GRAY}Ref: btl1-field-notes 06_Incident_Response (lifecycle + live response) + DFIR-Toolkit artifact list.{C.RESET}")
+    print(f"  1. Preparation")
+    print(f"  2. Detection & Analysis (triage)")
+    print(f"  3. Containment")
+    print(f"  4. Eradication")
+    print(f"  5. Recovery")
+    print(f"  6. Lessons Learned")
+    print(f"  7. Linux live-response bundle (DFIR-style)")
     ch = input(f"\n  {C.CYAN}Select>{C.RESET} ").strip()
-    if ch == "1":
-        print(f"  {C.PINK}Containment:{C.RESET}")
-        print(f"    - Isolate affected systems")
-        print(f"    - Block suspicious IPs")
-        print(f"    - Preserve evidence")
-    elif ch == "2":
-        print(f"  {C.PINK}Eradication:{C.RESET}")
-        print(f"    - Remove malware")
-        print(f"    - Patch vulnerabilities")
-        print(f"    - Rotate credentials")
-    elif ch == "3":
-        print(f"  {C.PINK}Recovery:{C.RESET}")
-        print(f"    - Restore from clean backups")
-        print(f"    - Monitor for re-infection")
-        print(f"    - Document lessons learned")
+    plays = {
+        "1": ["Scope + roles", "Preserve logs", "Comms channel", "Legal hold if needed"],
+        "2": ["Identify IOCs", "Check auth.log / syslog", "List conns: ss -tunap", "List procs: ps aux --forest"],
+        "3": ["Isolate host (net, not power)", "Block IPs at fw", "Snapshot / memory dump first", "Preserve evidence"],
+        "4": ["Kill malicious procs", "Remove persistence (cron, systemd, autoruns)", "Patch vuln", "Rotate creds"],
+        "5": ["Restore from clean backup", "Verify hashes", "Monitor 7d for re-infection", "Close case notes"],
+        "6": ["Timeline", "Root cause", "Detection gap", "Update Sigma/YARA + checklist"],
+    }
+    if ch in plays:
+        for step in plays[ch]:
+            print(f"    - {step}")
+    elif ch == "7":
+        host = platform.node() or "host"
+        outdir = Path(f"Collection_{host}")
+        (outdir / "logs").mkdir(parents=True, exist_ok=True)
+        for cmd, fname in [(["uptime"], "sysinfo.txt"), (["uname", "-a"], "sysinfo.txt"), (["df", "-h"], "sysinfo.txt"), (["ps", "aux", "--forest"], "process.txt"), (["ss", "-tunap"], "netstat.txt"), (["last", "-n", "20"], "users.txt")]:
+            o, _, _ = run(cmd, timeout=10)
+            if o:
+                with open(outdir / "logs" / fname, "a") as f:
+                    f.write(f"\n### {' '.join(cmd)}\n{o[:4000]}\n")
+        print(f"  {C.GREEN}Wrote DFIR-lite bundle to {outdir}/logs/{C.RESET}")
 
 def module_compliancerose():
     banner("ComplianceRose — CIS Checks")
