@@ -55,6 +55,12 @@ python3 IreneRose.py
 python3 IreneRose.py selftest
 ```
 
+## Guideline
+
+New here? Start with [`docs/USER-GUIDELINE.md`](docs/USER-GUIDELINE.md) —
+5-minute quick start, Windows / Kali / Arch setup, module tour,
+exports, and troubleshooting.
+
 ## License
 
 MIT
